@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 from typing import Optional
 
@@ -49,11 +50,23 @@ class InstaMonitorBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self) -> None:
-        await db.get_conn()         # init DB
-        await self.tree.sync()      # sync slash commands globally
+        await db.get_conn()  # init DB
+
+        guild_id = os.getenv("GUILD_ID")
+        if guild_id:
+            # Sync to specific server - commands appear INSTANTLY
+            guild = discord.Object(id=int(guild_id))
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)
+            logger.info("Slash commands synced to guild %s (instant).", guild_id)
+        else:
+            # Global sync - can take up to 1 hour to appear in Discord
+            await self.tree.sync()
+            logger.info("Slash commands synced globally (may take up to 1 hour).")
+
         scheduler.set_notify_callback(_notify_users)
         await scheduler.start()
-        logger.info("Bot setup complete — slash commands synced.")
+        logger.info("Bot setup complete.")
 
     async def on_ready(self) -> None:
         assert self.user is not None
@@ -200,11 +213,11 @@ async def cmd_broadcast(interaction: discord.Interaction, message: str) -> None:
     user_ids = [r[0] for r in rows]
 
     embed = discord.Embed(
-        title="📢 Broadcast",
+        title="Broadcast",
         description=message,
         colour=discord.Colour.orange(),
     )
-    embed.set_footer(text="Instagram Monitor — Admin Broadcast")
+    embed.set_footer(text="Instagram Monitor - Admin Broadcast")
 
     sent, failed = 0, 0
     for uid in user_ids:
@@ -249,14 +262,14 @@ async def cmd_history(interaction: discord.Interaction, username: str, limit: in
         return
 
     embed = discord.Embed(
-        title=f"📜 Event History — @{username}",
+        title=f"Event History - @{username}",
         colour=discord.Colour.blurple(),
     )
     lines = []
     for ev in events:
         etype = ev["event_type"]
         emoji = {"down": "🔴", "restored": "🟢", "error": "⚠️", "check": "🔵"}.get(etype, "•")
-        lines.append(f"{emoji} `{ev['created_at']}` — **{etype}** {ev.get('detail','')}")
+        lines.append(f"{emoji} `{ev['created_at']}` - **{etype}** {ev.get('detail','')}")
     embed.description = "\n".join(lines)
     embed.set_footer(text="Instagram Monitor")
     await interaction.followup.send(embed=embed, ephemeral=True)
