@@ -56,37 +56,21 @@ def _random_headers() -> dict:
 # Proxy list support
 # ---------------------------------------------------------------------------
 def _load_proxies() -> list[str]:
-    """
-    Load proxies from env. Supports two formats:
-
-    Single proxy:
-        PROXY_URL=http://user:pass@proxy.webshare.io:80
-
-    Multiple proxies (comma-separated):
-        PROXY_URLS=http://user:pass@p1.host:80,http://user:pass@p2.host:80
-
-    Proxy list file (one per line):
-        PROXY_FILE=/data/proxies.txt
-    """
     proxies = []
 
-    # Single proxy
     single = os.getenv("PROXY_URL", "").strip()
     if single:
         proxies.append(single)
 
-    # Multiple proxies comma-separated
     multi = os.getenv("PROXY_URLS", "").strip()
     if multi:
         proxies.extend([p.strip() for p in multi.split(",") if p.strip()])
 
-    # File-based proxy list
     proxy_file = os.getenv("PROXY_FILE", "").strip()
     if proxy_file and os.path.exists(proxy_file):
         with open(proxy_file) as f:
             proxies.extend([line.strip() for line in f if line.strip() and not line.startswith("#")])
 
-    # Deduplicate
     seen = set()
     unique = []
     for p in proxies:
@@ -103,44 +87,32 @@ def _load_proxies() -> list[str]:
 
 
 class ProxyRotator:
-    """Round-robin proxy rotator with per-proxy backoff on 429."""
-
     def __init__(self, proxies: list[str]):
         self._proxies = proxies
         self._index = 0
-        self._backoff: dict[str, float] = {}   # proxy_url -> monotonic time when usable again
+        self._backoff: dict[str, float] = {}
 
     def get(self) -> Optional[str]:
         if not self._proxies:
             return None
-
         now = asyncio.get_event_loop().time()
-        # Try each proxy starting from current index
         for _ in range(len(self._proxies)):
             proxy = self._proxies[self._index % len(self._proxies)]
             self._index += 1
-            until = self._backoff.get(proxy, 0)
-            if now >= until:
+            if now >= self._backoff.get(proxy, 0):
                 return proxy
-
-        # All proxies in backoff — return the one with the shortest wait
-        best = min(self._proxies, key=lambda p: self._backoff.get(p, 0))
-        return best
+        return min(self._proxies, key=lambda p: self._backoff.get(p, 0))
 
     def penalize(self, proxy: str, seconds: float = 60.0) -> None:
         until = asyncio.get_event_loop().time() + seconds
         self._backoff[proxy] = max(self._backoff.get(proxy, 0), until)
-        logger.warning("Proxy %s backed off for %.0fs.", proxy[:40], seconds)
+        logger.warning("Proxy backed off for %.0fs.", seconds)
 
 
 # ---------------------------------------------------------------------------
-# RapidAPI checker
+# RapidAPI checker — used as primary for protected/celebrity accounts
 # ---------------------------------------------------------------------------
 async def _check_via_rapidapi(client: httpx.AsyncClient, username: str) -> str:
-    """
-    Use RapidAPI Instagram Scraper as fallback.
-    Set RAPIDAPI_KEY env var to enable.
-    """
     key = os.getenv("RAPIDAPI_KEY", "")
     host = os.getenv("RAPIDAPI_HOST", "instagram-scraper-api2.p.rapidapi.com")
 
@@ -157,7 +129,6 @@ async def _check_via_rapidapi(client: httpx.AsyncClient, username: str) -> str:
         return "unavailable"
     if resp.status_code == 200:
         data = resp.json()
-        # Account exists and is accessible
         if data.get("data") or data.get("user"):
             return "available"
         return "unavailable"
@@ -173,10 +144,8 @@ async def _check_via_rapidapi(client: httpx.AsyncClient, username: str) -> str:
 async def _check_direct(client: httpx.AsyncClient, username: str, proxy: Optional[str]) -> str:
     url = f"https://www.instagram.com/{username}/"
     headers = _random_headers()
-
     kwargs = dict(headers=headers, follow_redirects=True, timeout=config.REQUEST_TIMEOUT)
 
-    # httpx proxy per-request support
     if proxy:
         transport = httpx.AsyncHTTPTransport(proxy=proxy)
         async with httpx.AsyncClient(transport=transport, timeout=config.REQUEST_TIMEOUT) as px_client:
@@ -207,7 +176,7 @@ async def _check_direct(client: httpx.AsyncClient, username: str, proxy: Optiona
 
 
 # ---------------------------------------------------------------------------
-# Unified check with fallback chain
+# Smart check: RapidAPI first if available, proxy/direct as fallback
 # ---------------------------------------------------------------------------
 async def _check_instagram(
     client: httpx.AsyncClient,
@@ -216,36 +185,44 @@ async def _check_instagram(
     use_rapidapi: bool,
 ) -> str:
     """
-    Check order:
-    1. If proxy available → direct check via proxy
-    2. If RapidAPI configured → RapidAPI check
-    3. Direct check (no proxy — Railway IP, may get rate-limited)
+    Smart fallback chain:
+    1. RapidAPI (if configured) — most reliable, bypasses all IP bans
+    2. Proxy direct check (if configured)
+    3. Raw direct check (Railway IP — last resort)
     """
-    proxy = proxy_rotator.get() if proxy_rotator else None
 
-    try:
-        if proxy:
-            result = await _check_direct(client, username, proxy)
-            return result
-    except httpx.HTTPStatusError as exc:
-        code = exc.response.status_code if exc.response else 0
-        if code in (429, 403) and proxy_rotator and proxy:
-            proxy_rotator.penalize(proxy, seconds=random.uniform(30, 90))
-        # Fall through to RapidAPI or direct
-        logger.debug("Proxy check failed for @%s (%d), trying fallback.", username, code)
-    except Exception as exc:
-        logger.debug("Proxy check error for @%s: %s, trying fallback.", username, exc)
-
-    # RapidAPI fallback
+    # --- Try RapidAPI FIRST (most reliable for all accounts) ---
     if use_rapidapi:
         try:
-            return await _check_via_rapidapi(client, username)
-        except httpx.HTTPStatusError:
-            raise   # Let caller handle rate limit
+            result = await _check_via_rapidapi(client, username)
+            logger.debug("@%s checked via RapidAPI: %s", username, result)
+            return result
+        except httpx.HTTPStatusError as exc:
+            code = exc.response.status_code if exc.response else 0
+            if code == 429:
+                logger.warning("RapidAPI rate-limited for @%s. Falling back to proxy/direct.", username)
+            else:
+                logger.debug("RapidAPI error for @%s: HTTP %d. Trying next method.", username, code)
         except Exception as exc:
-            logger.debug("RapidAPI check error for @%s: %s", username, exc)
+            logger.debug("RapidAPI exception for @%s: %s. Trying next method.", username, exc)
 
-    # Last resort — direct (no proxy)
+    # --- Try proxy direct check ---
+    proxy = proxy_rotator.get() if proxy_rotator else None
+    if proxy:
+        try:
+            result = await _check_direct(client, username, proxy)
+            logger.debug("@%s checked via proxy: %s", username, result)
+            return result
+        except httpx.HTTPStatusError as exc:
+            code = exc.response.status_code if exc.response else 0
+            if code in (429, 403) and proxy_rotator:
+                proxy_rotator.penalize(proxy, seconds=random.uniform(60, 120))
+            logger.debug("Proxy check failed for @%s (HTTP %d). Trying direct.", username, code)
+        except Exception as exc:
+            logger.debug("Proxy check error for @%s: %s. Trying direct.", username, exc)
+
+    # --- Last resort: raw direct (Railway IP) ---
+    logger.debug("@%s falling back to raw direct check.", username)
     return await _check_direct(client, username, proxy=None)
 
 
@@ -270,14 +247,16 @@ class MonitorScheduler:
             return
         self._running = True
 
-        # Init proxies
         proxies = _load_proxies()
         self._proxy_rotator = ProxyRotator(proxies) if proxies else None
-
-        # Check if RapidAPI is configured
         self._use_rapidapi = bool(os.getenv("RAPIDAPI_KEY", "").strip())
+
         if self._use_rapidapi:
-            logger.info("RapidAPI fallback enabled.")
+            logger.info("RapidAPI is PRIMARY method (most reliable).")
+        if self._proxy_rotator:
+            logger.info("Proxy rotation configured as fallback.")
+        if not self._use_rapidapi and not self._proxy_rotator:
+            logger.warning("No proxy or RapidAPI configured — using raw Railway IP (expect 429s on popular accounts).")
 
         self._client = httpx.AsyncClient(
             limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
@@ -314,9 +293,7 @@ class MonitorScheduler:
     async def _process_account(self, row: dict) -> None:
         async with self._semaphore:
             await self._rate_limiter.acquire()
-
-            # Small random delay to spread requests naturally
-            await asyncio.sleep(random.uniform(0.5, 3.0))
+            await asyncio.sleep(random.uniform(0.5, 2.0))
 
             account_id: int = row["id"]
             username: str = row["username"]
@@ -324,7 +301,6 @@ class MonitorScheduler:
             alert_mode: bool = bool(row.get("alert_mode"))
             alert_mode_until: Optional[str] = row.get("alert_mode_until")
 
-            # Check if alert_mode expired
             if alert_mode and alert_mode_until:
                 try:
                     until_dt = datetime.strptime(alert_mode_until, "%Y-%m-%d %H:%M:%S").replace(
@@ -356,9 +332,7 @@ class MonitorScheduler:
                             config.BACKOFF_BASE ** (attempt + 2) + random.uniform(5, 15),
                             config.MAX_BACKOFF,
                         )
-                        logger.warning(
-                            "Rate-limited on @%s (HTTP %d). Backoff %.0fs.", username, code, wait
-                        )
+                        logger.warning("Rate-limited on @%s (HTTP %d). Backoff %.0fs.", username, code, wait)
                         await db.set_backoff(account_id, add_seconds(wait))
                         backoff_applied = True
                         break
@@ -375,7 +349,7 @@ class MonitorScheduler:
                 return
 
             if new_status is None:
-                logger.error("All retries failed for @%s; skipping update.", username)
+                logger.error("All retries failed for @%s; skipping.", username)
                 user_ids = await db.get_trackers(username)
                 for uid in user_ids:
                     await db.log_event(username, uid, "error", "All retries failed")
@@ -386,14 +360,12 @@ class MonitorScheduler:
                 )
                 return
 
-            # Status change detection
             status_changed = (prev_status is not None) and (new_status != prev_status)
 
             if status_changed:
                 logger.info("@%s status: %s -> %s", username, prev_status, new_status)
                 alert_mode = True
                 alert_mode_until = add_seconds(config.ALERT_MODE_DURATION)
-
                 user_ids = await db.get_trackers(username)
                 event_type = "restored" if new_status == "available" else "down"
 
@@ -408,7 +380,6 @@ class MonitorScheduler:
             else:
                 logger.debug("@%s status unchanged: %s", username, new_status)
 
-            # Schedule next check
             if alert_mode:
                 interval = jitter(config.ALERT_CHECK_INTERVAL_MIN, config.ALERT_CHECK_INTERVAL_MAX)
             else:
